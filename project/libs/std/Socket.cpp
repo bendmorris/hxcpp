@@ -45,6 +45,13 @@
 #	define SOCKET_ERROR (-1)
 #	define INVALID_SOCKET (-1)
 #endif
+#ifdef NEKO_LINUX
+#	include <sys/epoll.h>
+#	define HAS_EPOLL
+#else
+#	define EPOLLIN 0x001
+#	define EPOLLOUT 0x004
+#endif
 
 #if defined(NEKO_WINDOWS) || defined(NEKO_MAC)
 #	define MSG_NOSIGNAL 0
@@ -67,12 +74,28 @@ typedef struct {
 	value widx;
 } polldata;
 
+typedef struct {
+	int maxevents;
+	value result;
+#ifndef HAS_EPOLL
+	value read;
+	value write;
+	int rcount;
+	int wcount;
+#else
+	int epollfd;
+	struct epoll_event *events;
+#endif
+} epolldata;
+
 DECLARE_KIND(k_socket);
 DECLARE_KIND(k_poll);
+DECLARE_KIND(k_epoll);
 
 typedef size_t socket_int;
 
 #define val_poll(o)		((polldata*)val_data(o))
+#define val_epoll(o)	((epolldata*)val_data(o))
 
 extern field id___s;
 
@@ -457,15 +480,14 @@ static value socket_listen( value o, value n ) {
 
 static fd_set INVALID;
 
-static fd_set *make_socket_array( value a, fd_set *tmp, SOCKET *n ) {
-	int i, len;
+static fd_set *make_socket_array( value a, int len, fd_set *tmp, SOCKET *n ) {
+	int i;
 	SOCKET sock;
 	FD_ZERO(tmp);
 	if( val_is_null(a) )
 		return tmp;
 	if( !val_is_array(a) )
 		return &INVALID;
-	len = val_array_size(a);
 	if( len > FD_SETSIZE )
 		val_throw(alloc_string("Too many sockets in select"));
 	for(i=0;i<len;i++) {
@@ -535,9 +557,9 @@ static value socket_select( value rs, value ws, value es, value timeout ) {
 	fd_set *ra, *wa, *ea;
 	value r;
 	POSIX_LABEL(select_again);
-	ra = make_socket_array(rs,&rx,&n);
-	wa = make_socket_array(ws,&wx,&n);
-	ea = make_socket_array(es,&ex,&n);
+	ra = make_socket_array(rs,val_array_size(rs),&rx,&n);
+	wa = make_socket_array(ws,val_array_size(ws),&wx,&n);
+	ea = make_socket_array(es,val_array_size(es),&ex,&n);
 	if( ra == &INVALID || wa == &INVALID || ea == &INVALID )
 	{
 		val_throw( alloc_string("No valid sockets") );
@@ -579,9 +601,9 @@ static value socket_fast_select( value rs, value ws, value es, value timeout )
     fd_set *ra, *wa, *ea;
     value r;
     POSIX_LABEL(select_again);
-    ra = make_socket_array(rs,&rx,&n);
-    wa = make_socket_array(ws,&wx,&n);
-    ea = make_socket_array(es,&ex,&n);
+    ra = make_socket_array(rs,val_array_size(rs),&rx,&n);
+    wa = make_socket_array(ws,val_array_size(ws),&wx,&n);
+    ea = make_socket_array(es,val_array_size(es),&ex,&n);
     if( ra == &INVALID || wa == &INVALID || ea == &INVALID )
     {
             val_throw( alloc_string("No valid sockets") );
@@ -1016,6 +1038,172 @@ static value socket_poll( value socks, value pdata, value timeout ) {
 	return a;
 }
 
+
+/**
+	socket_epoll_alloc : void -> 'epoll
+	<doc>
+	Allocate memory for edge/level-triggered polling (epoll).
+
+	On Linux, this will use epoll; on other systems, this will fall back to select.
+	</doc>
+**/
+static value socket_epoll_alloc(value maxevents) {
+	val_check(maxevents,int);
+	epolldata *ep;
+	ep = (epolldata*)malloc(sizeof(epolldata));
+	ep->maxevents = val_int(maxevents);
+	ep->result = alloc_array(val_int(maxevents));
+#ifndef HAS_EPOLL
+	ep->read = alloc_array(FD_SETSIZE);
+	ep->write = alloc_array(FD_SETSIZE);
+	ep->rcount = 0;
+	ep->wcount = 0;
+#else
+	ep->epollfd = epoll_create1(0);
+	ep->events = (struct epoll_event*)alloc(sizeof(struct epoll_event) * val_int(maxevents));
+#endif
+	return alloc_abstract(k_epoll, ep);
+}
+
+
+/**
+	socket_epoll_register : 'epoll -> 'socket -> int
+	<doc>Register a socket with an epoll instance to be notified of events. Returns the socket's fd.</doc>
+**/
+static value socket_epoll_register(value e, value s, value events) {
+	val_check_kind(e,k_epoll);
+	val_check_kind(s,k_socket);
+	val_check(events,int);
+	SOCKET sock = val_sock(s);
+	int event_types = val_int(events);
+	epolldata *ep = val_epoll(e);
+#ifndef NEKO_LINUX
+	if (sock >= FD_SETSIZE)
+		val_throw(alloc_string("Can't register file descriptor >= FD_SETSIZE"));
+	if (event_types & EPOLLIN) {
+		if (ep->rcount >= FD_SETSIZE)
+			val_throw(alloc_string("Too many sockets (on non-Linux platforms, 'epoll' uses select)"));
+		val_array_set_i(ep->read, ep->rcount++, s);
+	}
+	if (event_types & EPOLLOUT) {
+		if (ep->wcount >= FD_SETSIZE)
+			val_throw(alloc_string("Too many sockets (on non-Linux platforms, 'epoll' uses select)"));
+		val_array_set_i(ep->write, ep->wcount++, s);
+	}
+#else
+	struct epoll_event ev;
+	ev.events = event_types;
+	ev.data.fd = sock;
+	int ret = epoll_ctl(ep->epollfd, EPOLL_CTL_ADD, sock, &ev);
+	if (ret == -1)
+		val_throw(alloc_int(errno));
+#endif
+	return alloc_int(sock);
+}
+
+
+/**
+	socket_epoll_unregister : 'epoll -> 'socket -> int
+	<doc>Unegister a socket with an epoll instance. Returns the socket's fd.</doc>
+**/
+static value socket_epoll_unregister(value e, value s) {
+	val_check_kind(e,k_epoll);
+	SOCKET sock = val_sock(s);
+	epolldata *ep = val_epoll(e);
+#ifndef NEKO_LINUX
+	int i, j;
+	for (i = 0; i < ep->rcount; i++) {
+		if (val_array_i(ep->read, i) == s) {
+			for (j = i+1; j < ep->rcount; j++) {
+				val_array_set_i(ep->read, j, val_array_i(ep->read, j-1));
+			}
+			val_array_set_i(ep->read, --ep->rcount, NULL);
+			--i;
+		}
+	}
+	for (i = 0; i < ep->wcount; i++) {
+		if (val_array_i(ep->write, i) == s) {
+			for (j = i+1; j < ep->wcount; j++) {
+				val_array_set_i(ep->write, j, val_array_i(ep->write, j-1));
+			}
+			val_array_set_i(ep->read, --ep->wcount, NULL);
+			--i;
+		}
+	}
+#else
+	struct epoll_event ev;
+	int ret = epoll_ctl(ep->epollfd, EPOLL_CTL_DEL, sock, &ev);
+	if (ret == -1)
+		return alloc_int(ret);
+	else
+#endif
+	return alloc_int(sock);
+}
+
+
+/**
+	socket_epoll_wait : 'epoll -> int -> float -> int array
+	<doc>Wait and return a list of socket fds with events.</doc>
+**/
+static value socket_epoll_wait(value e, value timeout) {
+	val_check_kind(e,k_epoll);
+	epolldata *ep = val_epoll(e);
+#ifndef HAS_EPOLL
+	struct timeval t;
+	SOCKET n = 0;
+	fd_set rx, wx;
+	fd_set *ra, *wa;
+	POSIX_LABEL(select_again);
+	ra = ep->rcount == 0 ? NULL : make_socket_array(ep->read, ep->rcount, &rx, &n);
+	wa = ep->wcount == 0 ? NULL : make_socket_array(ep->write, ep->wcount, &wx, &n);
+	bool indefinite = val_is_null(timeout);
+	if (!indefinite) {
+		val_check(timeout,number);
+		init_timeval(val_number(timeout),&t);
+	}
+	if( select((int)(n+1),ra,wa,NULL,indefinite ? NULL : &t) == SOCKET_ERROR ) {
+		HANDLE_EINTR(select_again);
+		val_throw(alloc_int(errno));
+	}
+	int i;
+	int pos = 0;
+	if (ra != NULL) {
+		for (i=0; i < ep->rcount && pos < ep->maxevents; i++) {
+			value s = val_array_i(ep->read, i);
+			if (FD_ISSET(val_sock(s),ra))
+				val_array_set_i(ep->result, pos++, alloc_int(val_sock(s)));
+		}
+	}
+	if (wa != NULL) {
+		for (i=0; i < ep->wcount && pos < ep->maxevents; i++) {
+			value s = val_array_i(ep->write, i);
+			if (FD_ISSET(val_sock(s),wa))
+				val_array_set_i(ep->result, pos++, alloc_int(val_sock(s)));
+		}
+	}
+	val_array_set_size(ep->result,pos);
+	return ep->result;
+#else
+	int t;
+	if (val_is_null(timeout))
+		t = -1;
+	else {
+		val_check(timeout,number);
+		t = (int)(val_number(timeout)) * 1000;
+	}
+	int ret = epoll_wait(ep->epollfd, ep->events, ep->maxevents, t);
+	if (ret == -1)
+		val_throw(alloc_int(errno));
+	val_set_array_size(ep->result, ret);
+	int i;
+	for (i = 0; i < ret; i++) {
+		val_array_set_i(ep->result, i, alloc_int(ep->events[i].data.fd));
+	}
+	return ep->result;
+#endif
+}
+
+
 DEFINE_PRIM(socket_init,0);
 DEFINE_PRIM(socket_new,1);
 DEFINE_PRIM(socket_send,4);
@@ -1042,6 +1230,11 @@ DEFINE_PRIM(socket_poll_alloc,1);
 DEFINE_PRIM(socket_poll,3);
 DEFINE_PRIM(socket_poll_prepare,3);
 DEFINE_PRIM(socket_poll_events,2);
+
+DEFINE_PRIM(socket_epoll_alloc,1);
+DEFINE_PRIM(socket_epoll_register,3);
+DEFINE_PRIM(socket_epoll_unregister,2);
+DEFINE_PRIM(socket_epoll_wait,2);
 
 DEFINE_PRIM(host_local,0);
 DEFINE_PRIM(host_resolve,1);

@@ -39,6 +39,7 @@ DEFINE_KIND( k_file );
 DEFINE_KIND( k_socket );
 DEFINE_KIND( k_random );
 DEFINE_KIND( k_poll );
+DEFINE_KIND( k_epoll );
 
 extern "C" void std_main() {
     id_h = val_id("h");
@@ -61,6 +62,7 @@ extern "C" void std_main() {
     kind_share(&k_file,"file");
     kind_share(&k_socket,"socket");
     kind_share(&k_poll,"poll");
+    kind_share(&k_epoll,"epoll");
     kind_share(&k_random,"random");
 }
 
